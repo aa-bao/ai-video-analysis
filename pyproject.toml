@@ -1,0 +1,38 @@
+[project]
+name = "xxzw-video"
+version = "0.1.0"
+description = "AI video insight agent (P2 of the AI workbench split)"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  # 鉴权（auth/passwords.py 用 argon2 直接哈希，非 passlib）
+  "argon2-cffi>=23.1",
+  # 视频：抽帧 / 音频切片（av + 自带 ffmpeg 二进制，故镜像无需 apt install ffmpeg）
+  "av>=14.0",
+  "imageio-ffmpeg>=0.6",
+  # yt-dlp 以 `sys.executable -m yt_dlp` 调用，必须是 Python 包而非外部二进制
+  "yt-dlp>=2026.1",
+  # Web 层
+  "fastapi>=0.115",
+  "httpx>=0.28",
+  "python-multipart>=0.0.32",
+  "uvicorn[standard]>=0.34",
+  # 存储
+  "asyncpg>=0.29",
+  "sqlalchemy[asyncio]>=2.0.36",
+  # 配置
+  "pyyaml>=6.0",
+  # 抖音 Cookie 自动导出：解 Chrome/Edge 的 v10/v11 AES-GCM 加密值
+  "cryptography>=42",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.25",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+asyncio_mode = "auto"
+pythonpath = ["."]
+testpaths = ["tests"]

@@ -1,0 +1,53 @@
+# =============================================================================
+# P2 · AI 视频解析 Agent —— Git 忽略规则
+# ⚠️ 本仓库要推到公网 GitHub，凭据类文件**一律不得入库**。
+# =============================================================================
+
+# ── 凭据：绝不入库（明文登录态 / API Key）──
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+cookies.txt
+cookies_douyin.txt
+cookies*.txt
+*.probe-bak
+*.bak
+wx-cookies/
+
+# ── 运行期数据（体积大且含用户内容）──
+data/
+*.log
+.pytest_cache/
+.pytest-tmp-*
+
+# ── Python ──
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+
+# ── Node / 前端构建产物 ──
+node_modules/
+web/node_modules/
+web/dist/
+web/.vite/
+dist/
+*.tsbuildinfo
+
+# ── 编辑器 / 系统 ──
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ── 工作流残留（报告 / 临时脚本 / 备份）──
+.workbuddy/
+.phase5a-backup/
+.impeccable.md

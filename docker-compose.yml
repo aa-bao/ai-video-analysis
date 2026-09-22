@@ -1,0 +1,215 @@
+# =============================================================================
+# P2 · AI 视频解析 Agent —— 部署编排（阶段 5b / 任务 1）
+# 设计依据：docs/AI工作台独立化改造可行性分析.md §7.1 / §7.2 / §7.3 / §8.2
+# =============================================================================
+#
+# 与 P1 的关系（关键约束）：
+# - 不自带 postgres：复用 P1 起的那个 PG 容器（方案 §7.1：1 个容器、2 个 database
+#   `rag` / `video`）。P1 的 postgres 服务名 `postgres`、容器名 `xxzw-postgres`，
+#   与本 compose 同处 `xxzw-net` 网络，故 DATABASE_URL 指向 postgres:5432/video。
+# - ⚠️ 跨 compose 的 depends_on 不生效：本文件 db-migrate 的 `depends_on: postgres`
+#   仅当两个 compose 共享同一网络且 P1 的 PG 已先起时"逻辑可达"，compose 本身不会
+#   等待另一个文件里的服务。⇒ 启动前提：先起 P1 的 PG，再起 P2。若 PG 未就绪，
+#   db-migrate 会因连不上 postgres 失败（幂等，PG 就绪后重跑即可）。
+# - ⚠️ P1 侧须也把默认网络命名为 `xxzw-net`（networks: {default: {name: xxzw-net}}），
+#   否则两个 compose 各用各自的 auto 网络，容器名无法互访。P2 侧已如此设置；
+#   P1 侧同步由 P1 agent 负责（见报告未闭合项）。
+# - ⚠️ `video` 库不在 schema.sql 内创建（其只建表）。db-migrate 在灌表前先
+#   `CREATE DATABASE video`（幂等），故无需手动建库。
+#
+# profile=video：裸 `docker compose up` 只校验配置、不拉起重负载组件。视频解析是
+# 2C4G 上唯一重负载（§7.3：视频任务全局串行 1 是容量前提），故默认不启，按需
+# `docker compose --profile video up` 启动。
+# =============================================================================
+
+networks:
+  # ⚠️ 必须 `external: true`：网络 `xxzw-net` 由 P1 的 compose 创建，其网络**键名**为
+  # `xxzw-net`，故容器网络带标签 com.docker.compose.network=xxzw-net。若此处改用
+  # `default: {name: xxzw-net}`，本 compose 期望的标签是 `default`（键名即标签）→
+  # 标签不匹配 → compose 拒绝复用已有网络并整体失败：
+  #   "network xxzw-net was found but has incorrect label ... (expected: \"default\")"
+  # （阶段 5c 实测踩到）。external 只按网络名引用、不校验标签。
+  # ⇒ 启动顺序成为**硬约束**：必须先起 P1（创建 xxzw-net），再起 P2。
+  default:
+    external: true
+    name: xxzw-net
+
+services:
+  # ── 后端（P2 AI 视频解析 Agent）──
+  video:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-rag}:${POSTGRES_PASSWORD:-rag}@postgres:5432/video
+      # ⚠️ 容器内**必须** production，不能写成 ${APP_ENV:-production}：宿主的
+      # `.env` 里 APP_ENV=development（本地开发用），会被 compose 插值**覆盖**掉默认值，
+      # 于是容器也跑成 development —— 后果是 cookie 路径解析成项目根
+      # `/app/cookies_douyin.txt`（已被 .dockerignore 排除 → 恒不存在），
+      # 而绑载的 `/app/data/video/cookies/` 里的 cookie **根本读不到**，抖音下载必失败。
+      # 同理 task_root 会落到 /app/data/video_tasks 而非卷内既定布局。
+      # 生产语义是硬约束：数据根锁定在卷、密钥走 /run/secrets、cookie 走数据根子路径。
+      APP_ENV: production
+      APP_DATA_ROOT: /app/data
+      APP_SECRET_ROOT: /run/secrets
+      MODEL_RELAY_BASE_URL: ${MODEL_RELAY_BASE_URL}
+      MODEL_RELAY_API_KEY: ${MODEL_RELAY_API_KEY}
+      CHAT_MODEL: ${CHAT_MODEL}
+      # ── 百炼（DashScope）ASR ──
+      # ⚠️ 此前只传了 VOLC_ASR_*，漏了 DASHSCOPE_ASR_* —— 而当前渠道是百炼，
+      # 结果容器内 ASR 未配置 → 解析任务在转写阶段直接抛「ASR 凭证未配置」。
+      # ASR_UPLOAD_MODE=oss 走「本地直传 OSS + oss:// URL」，只要求**出网**，
+      # 不要求入站公网可达（生产部署的关键前提）。
+      #
+      # ⚠️ ASR_PROVIDER **必须显式传**：settings.py 的 ASR_PROVIDER_DEFAULT 是
+      # "volcengine"，不传就回退到火山分支去读 VOLC_ASR_API_KEY（空）→
+      # asr_configured=False，即使 DASHSCOPE_ASR_API_KEY 已正确注入也没用。
+      ASR_PROVIDER: ${ASR_PROVIDER:-dashscope}
+      ASR_UPLOAD_MODE: ${ASR_UPLOAD_MODE:-oss}
+      DASHSCOPE_ASR_API_KEY: ${DASHSCOPE_ASR_API_KEY}
+      DASHSCOPE_ASR_MODEL: ${DASHSCOPE_ASR_MODEL:-qwen-audio-3.1-asr-flash-filetrans}
+      DASHSCOPE_ASR_ENDPOINT: ${DASHSCOPE_ASR_ENDPOINT:-https://dashscope.aliyuncs.com/api/v1/services/audio/asr/transcription}
+      # 仅 public-url 模式需要；oss 模式留空
+      DASHSCOPE_ASR_PUBLIC_BASE_URL: ${DASHSCOPE_ASR_PUBLIC_BASE_URL:-}
+      VOLC_ASR_API_KEY: ${VOLC_ASR_API_KEY}
+      VOLC_ASR_APP_ID: ${VOLC_ASR_APP_ID}
+      VOLC_ASR_ACCESS_TOKEN: ${VOLC_ASR_ACCESS_TOKEN}
+      VOLC_ASR_RESOURCE_ID: ${VOLC_ASR_RESOURCE_ID:-volc.bigasr.auc_turbo}
+      VOLC_CHAT_BASE_URL: ${VOLC_CHAT_BASE_URL}
+      VOLC_CHAT_MODEL: ${VOLC_CHAT_MODEL}
+      VOLC_CHAT_QA_MODEL: ${VOLC_CHAT_QA_MODEL}
+      VOLC_CHAT_API_KEY: ${VOLC_CHAT_API_KEY}
+      VOLC_CHAT_QA_BASE_URL: ${VOLC_CHAT_QA_BASE_URL}
+      VOLC_CHAT_QA_API_KEY: ${VOLC_CHAT_QA_API_KEY}
+      # compose 内用服务名互访；宿主侧可在 .env 覆盖为 http://127.0.0.1:2022
+      WX_CHANNELS_API_BASE_URL: ${WX_CHANNELS_API_BASE_URL:-http://wx-channels:2022}
+      VIDEO_ARTIFACT_QUOTA_BYTES: ${VIDEO_ARTIFACT_QUOTA_BYTES:-37580963840}
+      VIDEO_DISK_WARN_PERCENT: ${VIDEO_DISK_WARN_PERCENT:-80}
+      VIDEO_DISK_CRITICAL_PERCENT: ${VIDEO_DISK_CRITICAL_PERCENT:-90}
+      VIDEO_MEDIA_EGRESS_PROXY: ${VIDEO_MEDIA_EGRESS_PROXY}
+      # 摘要输出预算（含推理模型的思维链）。留空用默认 8000。
+      # ⚠️ 实测 deepseek-flash：2000 时思维链吃掉 ~1891，JSON 被截断 → 摘要静默为空。
+      VIDEO_SUMMARY_MAX_TOKENS: ${VIDEO_SUMMARY_MAX_TOKENS:-8000}
+      DEV_AUTH_BYPASS: ${DEV_AUTH_BYPASS}
+      DEV_AUTH_BYPASS_USER_ID: ${DEV_AUTH_BYPASS_USER_ID:-1}
+    ports:
+      - "127.0.0.1:8010:8010"
+    volumes:
+      # 生产化密钥挂载：test / production 下按文件名从 /run/secrets 读取密钥；
+      # 文件名必须等于环境变量名（如 ./secrets/MODEL_RELAY_API_KEY）。
+      # development 下不读取此目录，无副作用。源目录不存在时 Docker 自动建空目录，不破坏一键启动。
+      - ${APP_SECRET_DIR:-./secrets}:/run/secrets:ro
+      - videodata:/app/data
+      # ⚠️ 抖音 Cookie：生产路径锁定在**数据根**下（见 src/video/config.py 的
+      # PRODUCTION_ENVIRONMENTS 分支）→ /app/data/video/cookies/cookies_douyin.txt。
+      # 这里把宿主的 ./data/video/cookies 直接绑到该子路径，使「宿主侧更新 cookie」
+      # 对容器即时生效（免重建镜像），且凭据不落在镜像层（.dockerignore 已排除）。
+      # 宿主文件不存在时空目录会遮住卷内该子路径 —— 首次只需在设置页写入即可。
+      - ./data/video/cookies:/app/data/video/cookies
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/api/health/live')"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          # 后端常驻 RSS ~300–500 MiB；ffmpeg/ffprobe 抽帧转码峰值另加 300–800 MiB。
+          # 取 2048 MiB 而非 §7.2 的 1024，是为覆盖 4K 转码 ffmpeg 峰值而不 OOM；
+          # 取舍见报告（总量超 4 GiB，靠 P2 按需 + 任务串行吸收）。
+          memory: 2048M
+    profiles: ["video"]
+
+  # ── 前端（nginx，反代后端 /api/）──
+  web:
+    build:
+      context: web
+      dockerfile: Dockerfile
+    environment:
+      BACKEND_ORIGIN: http://video:8010
+      ALLOWED_FRAME_ANCESTORS: ${ALLOWED_FRAME_ANCESTORS:-}
+    ports:
+      # P1 的 web 已占宿主 8000，P2 换 8080
+      - "127.0.0.1:8080:80"
+    depends_on:
+      video:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:80/api/health/live"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    profiles: ["video"]
+
+  # ── 数据库结构初始化（幂等，可重复执行）──
+  db-migrate:
+    # ⚠️ 用 pgvector 镜像而非"同后端镜像"：后端是 python:3.12-slim，不含 psql 客户端，
+    # 无法执行 schema.sql。与 P1 的 db-migrate 一致采用 pgvector/pgvector:pg17。
+    # ⚠️ 不写 depends_on: postgres：postgres 在 P1 的 compose 里，跨 compose 的 depends_on
+    # 既不会生效，还会让本 compose 因"depends on undefined service"直接校验失败；
+    # 启动前提改为文档约束——先起 P1 的 PG（见顶部说明与 README）。
+    image: pgvector/pgvector:pg17
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-rag}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-rag}
+      PGDATABASE: video
+    volumes:
+      - ./schema.sql:/schema.sql:ro
+    # ⚠️ 跨 compose：depends_on: postgres 不保证 P1 的 PG 已起（见顶部说明）。
+    # schema.sql 只建表不建库；video 库不存在则先建（幂等），再灌表。
+    command:
+      - sh
+      - -c
+      - |
+        psql -v ON_ERROR_STOP=1 -d postgres -tc "SELECT 1 FROM pg_database WHERE datname='video'" | grep -q 1 || psql -d postgres -c "CREATE DATABASE video"
+        psql -v ON_ERROR_STOP=1 -f /schema.sql
+    restart: "no"
+    profiles: ["video"]
+
+  # ── 微信视频号下载服务（仅 P2 拥有；源码 ./wx-channels）──
+  wx-channels:
+    build:
+      context: ./wx-channels
+      dockerfile: Dockerfile
+    environment:
+      WX_VIDEO_HOME: /data
+      WX_CHANNELS_DOWNLOAD_CONFIG_FILEPATH: /data/config.yaml
+    ports:
+      - "127.0.0.1:2022:2022"
+    volumes:
+      # /data：配置/下载/sqlite；/cookies：登录态持久化（entrypoint 软链到此）
+      - wxdata:/data
+      - wxcookies:/cookies
+    healthcheck:
+      # busybox wget；探针路径未对闭源二进制逐一核实，仅作连通性粗探，见报告未闭合项
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:2022/"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    profiles: ["video"]
+
+volumes:
+  videodata:
+    # P2 容器内数据根（APP_DATA_ROOT=/app/data）。
+    # ⚠️ 35 GiB 硬配额由应用层实现（另一 agent 负责），运维侧需留意外部卷自身增长。
+  wxdata:
+  wxcookies:

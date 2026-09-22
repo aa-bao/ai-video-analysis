@@ -1,0 +1,438 @@
+"""摘要生成：Chat 模型（豆包方舟或系统 model_relay）生成 summary.json。
+
+支持多模态：
+- 当视频 agent 配置了独立 Chat 通道（chat_configured=True，例如豆包 2.1 Pro）
+  且有关键帧时，把关键帧图片以 OpenAI 兼容 content 数组发给模型，
+  生成画面洞察（visual_notes）和关键帧说明（keyframe_captions）。
+- 未配置独立通道 / 模型不支持图片时自动降级为纯转录摘要，不阻断流水线。
+
+摘要生成失败不致命：调用方降级为「无摘要」报告。
+"""
+from __future__ import annotations
+
+import base64
+import json
+import logging
+import os
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import httpx
+from pydantic import SecretStr
+
+from src.models.llm import ChatClient
+from src.video.settings import VideoAgentSettings
+
+logger = logging.getLogger(__name__)
+
+# 转录输入截断字符数（避免超长上下文）
+_TRANSCRIPT_LIMIT = 12000
+# 一次最多送入视觉模型的关键帧数量（覆盖前端可选上限 24 帧，
+# 避免 12/24 帧时只有抽样帧有画面描述）
+_MAX_VISUAL_FRAMES = 24
+
+# ⚠️ 摘要请求的输出预算 —— 必须把**思维链**也算进去，否则摘要会静默为空。
+#
+# 实测（deepseek-flash，5312 字转录）：max_tokens=2000 时
+# `completion_tokens` 用满 2000，其中 **1891 是 reasoning_tokens（思维链）**，
+# 真正留给 JSON 正文的只剩约 109 tokens → JSON 被**拦腰截断**（finish_reason=length）→
+# `_extract_json` 的 rfind("}") 找不到收尾括号 → 返回 None →
+# `_normalize_summary({})` → **summary 与 keypoints 全空、title 回填 title_hint**。
+# 现象极具迷惑性：调用方看到 title 有值、mode=summary，以为成功，实际摘要为空。
+#
+# 4000 时 completion_tokens≈2045（reasoning≈1574）可正常收尾；
+# 8000 时 reasoning≈1640 仍有充足余量。这里默认 8000 并留环境变量出口。
+_DEFAULT_SUMMARY_MAX_TOKENS = 8000
+
+
+def _summary_max_tokens() -> int:
+    """摘要输出 token 预算（含思维链）。可用 VIDEO_SUMMARY_MAX_TOKENS 覆盖。"""
+    raw = os.environ.get("VIDEO_SUMMARY_MAX_TOKENS", "").strip()
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError:
+            logger.warning("VIDEO_SUMMARY_MAX_TOKENS 非整数，回退默认：%r", raw)
+        else:
+            if value > 0:
+                return value
+            logger.warning("VIDEO_SUMMARY_MAX_TOKENS 必须为正数，回退默认：%r", raw)
+    return _DEFAULT_SUMMARY_MAX_TOKENS
+
+_SUMMARY_SYSTEM_PROMPT = (
+    "你是视频解析助手。下面是视频的完整转录文本（带 [MM:SS] 时间戳）。"
+    "请基于转录内容提炼视频的核心信息，只输出一个 JSON 对象（不要输出其他文字）：\n"
+    '{"title": "不超过30字的视频标题", '
+    '"summary": "3-5 句话的中文摘要，概括视频主旨与关键内容", '
+    '"keypoints": ["3-6 条要点，每条 1-2 句话，尽量引用时间戳说明出处"]}\n\n'
+    "【视频转录】\n"
+)
+
+_SUMMARY_VISION_SYSTEM_PROMPT = (
+    "你是视频解析助手。下面是视频的完整转录文本（带 [MM:SS] 时间戳），"
+    "随后还有若干张从视频中抽取的关键帧图片。"
+    "请把语音内容与画面内容融合分析，只输出一个 JSON 对象（不要输出其他文字）：\n"
+    '{"title": "不超过30字的视频标题", '
+    '"summary": "3-5 句话的中文摘要，概括视频主旨与关键内容", '
+    '"keypoints": ["3-6 条要点，每条 1-2 句话，尽量引用时间戳说明出处"], '
+    '"visual_notes": ["画面上可见但音频未提到的内容，如 PPT 标题、图表数值、UI 状态、操作步骤"], '
+    '"keyframe_captions": {"MM:SS": "该关键帧的一句话画面说明"}}\n\n'
+    "注意：keyframe_captions 的键必须是关键帧对应的时间戳（MM:SS 或 H:MM:SS）；"
+    "没有把握的画面细节不要编造。\n"
+    "【视频转录】\n"
+)
+
+
+def make_chat_client(
+    settings: VideoAgentSettings,
+    app,
+    *,
+    model: str | None = None,
+    qa: bool = False,
+) -> tuple[ChatClient, bool]:
+    """构造 ChatClient。
+
+    model 可覆盖 settings.chat_model / qa_model（例如问答用 Turbo、摘要用 Pro）。
+    qa=True 时优先使用问答模型的独立 Base URL / API Key；缺省字段回退到摘要配置。
+    返回 (client, owns_client)。owns_client=True 时调用方负责关闭底层
+    httpx client（独立通道）；False 时复用系统共享 client，不要关闭。
+    """
+    if qa:
+        base_url = settings.qa_base_url.strip() or settings.chat_base_url
+        api_key = settings.qa_api_key.strip() or settings.chat_api_key
+        chat_model = model or settings.qa_model or settings.chat_model
+        configured = settings.qa_configured
+    else:
+        base_url = settings.chat_base_url
+        api_key = settings.chat_api_key
+        chat_model = model or settings.chat_model
+        configured = settings.chat_configured
+
+    if configured:
+        view = SimpleNamespace(
+            base_url=base_url.rstrip("/"),
+            api_key=SecretStr(api_key),
+            chat_model=chat_model,
+        )
+        shell = type("_VideoChatShell", (), {"model_relay": view})()
+        # 豆包 2.1 Pro 生成完整摘要可能较慢（实测长转录约 70-120s），给足超时；
+        # trust_env=False：外部 Chat 服务直连为受控策略，不继承环境代理（规范 07 §4）
+        client = httpx.AsyncClient(timeout=300.0, trust_env=False)
+        return ChatClient(shell, client), True
+    return (
+        ChatClient(app.state.settings_shell, app.state.model_relay_client._client),
+        False,
+    )
+
+
+def _extract_json(text: str) -> dict[str, Any] | None:
+    """从模型输出中提取 JSON 对象（容忍 markdown 代码块/前后杂讯）。"""
+    if not text:
+        return None
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        data = json.loads(text[start:end + 1])
+        return data if isinstance(data, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def _format_timestamp(seconds: float) -> str:
+    """与前端一致的时间戳格式：MM:SS 或 H:MM:SS。"""
+    total = int(seconds)
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    secs = total % 60
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _parse_timestamp(value: str) -> float | None:
+    """解析 MM:SS / H:MM:SS / 秒数，失败返回 None。"""
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        if text.isdigit():
+            return float(text)
+        parts = text.split(":")
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + int(parts[1])
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+    except ValueError:
+        return None
+    return None
+
+
+def _image_to_data_url(path: str | Path) -> str | None:
+    p = Path(path)
+    if not p.is_file():
+        return None
+    try:
+        data = p.read_bytes()
+    except OSError:
+        return None
+    mime = "image/jpeg" if p.suffix.lower() in {".jpg", ".jpeg"} else "image/png"
+    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+def _sample_keyframes(
+    keyframes: list[dict[str, Any]], limit: int = _MAX_VISUAL_FRAMES
+) -> list[dict[str, Any]]:
+    """均匀抽样关键帧，避免一次请求塞入过多图片。"""
+    if not keyframes:
+        return []
+    if len(keyframes) <= limit:
+        return list(keyframes)
+    step = len(keyframes) / limit
+    picked: list[dict[str, Any]] = []
+    for i in range(limit):
+        picked.append(keyframes[int(i * step)])
+    return picked
+
+
+def _build_visual_messages(
+    transcript: str,
+    keyframes: list[dict[str, Any]],
+    title_hint: str = "",
+) -> list[dict[str, Any]]:
+    """构造多模态 messages：转录 + 抽样关键帧图片。"""
+    sampled = _sample_keyframes(keyframes)
+    timestamps = "、".join(
+        _format_timestamp(float(kf.get("timestamp_seconds") or 0))
+        for kf in sampled
+    )
+    content: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": _SUMMARY_VISION_SYSTEM_PROMPT
+            + (transcript or "")[:_TRANSCRIPT_LIMIT]
+            + (
+                f"\n\n视频标题提示（可为空）：{title_hint}\n"
+                if title_hint
+                else "\n"
+            )
+            + f"\n以下是 {len(sampled)} 张关键帧图片，按顺序与 keyframe_captions 键对应。\n"
+            + f"关键帧时间戳顺序：{timestamps}",
+        }
+    ]
+    for kf in sampled:
+        url = _image_to_data_url(str(kf.get("path") or ""))
+        if url:
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": url},
+            })
+    return [
+        {"role": "system", "content": "你是视频解析助手，请严格按照用户要求输出 JSON。"},
+        {"role": "user", "content": content},
+    ]
+
+
+def _normalize_summary(
+    data: dict[str, Any] | None,
+    *,
+    title_hint: str = "",
+    keyframes: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """把模型 JSON 归一化成 summary.json 结构。"""
+    data = data or {}
+    summary: dict[str, Any] = {
+        "title": str(data.get("title") or "").strip() or title_hint,
+        "summary": str(data.get("summary") or "").strip(),
+        "keypoints": [
+            str(k).strip() for k in (data.get("keypoints") or []) if str(k).strip()
+        ],
+        "visual_notes": [
+            str(v).strip() for v in (data.get("visual_notes") or []) if str(v).strip()
+        ],
+        "keyframe_captions": {},
+        "mode": "summary",
+    }
+    raw_captions = data.get("keyframe_captions")
+    if isinstance(raw_captions, dict):
+        captions: dict[str, str] = {}
+        for ts, cap in raw_captions.items():
+            cap_text = str(cap).strip()
+            if not cap_text:
+                continue
+            # 模型可能返回 "0:06" 而前端查 "00:06"，统一归一化时间戳键。
+            seconds = _parse_timestamp(str(ts))
+            key = _format_timestamp(seconds) if seconds is not None else str(ts).strip()
+            captions[key] = cap_text
+        summary["keyframe_captions"] = captions
+    # 没有返回画面说明时，为已有关键帧补空占位（保持结构稳定）
+    if keyframes and not summary["keyframe_captions"]:
+        summary["keyframe_captions"] = {}
+    return summary
+
+
+async def generate_summary(
+    transcript: str,
+    settings: VideoAgentSettings,
+    app,
+    *,
+    title_hint: str = "",
+    keyframes: list[dict[str, Any]] | None = None,
+    output_path=None,
+) -> dict[str, Any]:
+    """用 Chat 模型生成摘要并写入 output_dir/summary.json。
+
+    返回 summary dict（{title, summary, keypoints, visual_notes,
+    keyframe_captions, mode}），失败返回 {}。
+    """
+    text = (transcript or "").strip()
+    keyframes = list(keyframes or [])
+    if not text:
+        return {}
+    client, owns = make_chat_client(settings, app)
+    try:
+        # 优先多模态：独立 Chat 通道 + 有关键帧时尝试图片输入
+        if settings.chat_configured and keyframes:
+            try:
+                messages = _build_visual_messages(text, keyframes, title_hint)
+                answer = await client.complete(messages, max_tokens=_summary_max_tokens())
+                data = _extract_json(answer) or {}
+                summary = _normalize_summary(data, title_hint=title_hint, keyframes=keyframes)
+                if output_path is not None:
+                    _write_summary(output_path, summary)
+                return summary
+            except Exception as exc:  # noqa: BLE001 — 多模态失败降级纯文本
+                logger.warning("video multimodal summary failed, fallback to text: %s", exc)
+
+        messages = [
+            {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT + text[:_TRANSCRIPT_LIMIT]},
+            {"role": "user", "content": "请输出摘要 JSON。"},
+        ]
+        answer = await client.complete(messages, max_tokens=_summary_max_tokens())
+        data = _extract_json(answer) or {}
+        summary = _normalize_summary(data, title_hint=title_hint, keyframes=[])
+        if output_path is not None:
+            _write_summary(output_path, summary)
+        return summary
+    except Exception as exc:  # noqa: BLE001 — 摘要失败不致命
+        logger.warning("video summary generation failed: %s", exc)
+        return {}
+    finally:
+        if owns:
+            try:
+                await client._client.aclose()
+            except Exception:
+                pass
+
+
+_IMAGE_POST_SYSTEM_PROMPT = (
+    "你是图文内容解析助手。下面是一篇社交媒体图文帖的正文，随后还有若干张帖子图片。"
+    "请结合文章文字与图片内容，只输出一个 JSON 对象（不要输出其他文字）：\n"
+    '{"title": "不超过30字的标题", '
+    '"summary": "3-6 句话的中文摘要，概括图文主旨与核心信息", '
+    '"keypoints": ["3-6 条要点，每条 1-2 句话"], '
+    '"image_captions": {"图片1": "该图的一句话说明", "图片2": "..."}}\n\n'
+    "注意：image_captions 的键建议使用「图片1」「图片2」等与图片顺序一致，"
+    "没有把握的图片不要编造。\n【图文正文】\n"
+)
+
+
+def _normalize_image_post_summary(data: dict[str, Any] | None, *, title_hint: str = "") -> dict[str, Any]:
+    data = data or {}
+    captions: dict[str, str] = {}
+    raw_captions = data.get("image_captions")
+    if isinstance(raw_captions, dict):
+        for key, value in raw_captions.items():
+            text = str(value).strip()
+            if text:
+                captions[str(key).strip()] = text
+    return {
+        "title": str(data.get("title") or "").strip() or title_hint,
+        "summary": str(data.get("summary") or "").strip(),
+        "keypoints": [str(k).strip() for k in (data.get("keypoints") or []) if str(k).strip()],
+        "visual_notes": [],
+        "keyframe_captions": {},
+        "image_captions": captions,
+        "mode": "image_text",
+    }
+
+
+async def generate_image_post_summary(
+    post_text: str,
+    images: list[dict[str, Any]],
+    settings: VideoAgentSettings,
+    app,
+    *,
+    title_hint: str = "",
+    output_path=None,
+) -> dict[str, Any]:
+    """用多模态 Chat 生成图文帖摘要与分图说明；失败返回 {}。"""
+    client, owns = make_chat_client(settings, app)
+    try:
+        content: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": _IMAGE_POST_SYSTEM_PROMPT
+                + (post_text or "")[:_TRANSCRIPT_LIMIT]
+                + "\n以下按顺序附帖子图片。",
+            }
+        ]
+        for img in images[: _MAX_VISUAL_FRAMES]:
+            url = _image_to_data_url(str(img.get("path") or ""))
+            if url:
+                content.append({"type": "image_url", "image_url": {"url": url}})
+        if len(content) == 1:
+            # 没有可用图片时退化为纯文本总结
+            messages = [
+                {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT + (post_text or "")[:_TRANSCRIPT_LIMIT]},
+                {"role": "user", "content": "请输出摘要 JSON。"},
+            ]
+            answer = await client.complete(messages, max_tokens=_summary_max_tokens())
+        else:
+            messages = [
+                {"role": "system", "content": "你是图文内容解析助手，请严格按照用户要求输出 JSON。"},
+                {"role": "user", "content": content},
+            ]
+            try:
+                answer = await client.complete(messages, max_tokens=_summary_max_tokens())
+            except Exception as exc:  # noqa: BLE001
+                # 当前模型不支持图片时降级为纯文本摘要
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "image post multimodal summary failed, fallback to text: %s", exc
+                )
+                messages = [
+                    {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT + (post_text or "")[:_TRANSCRIPT_LIMIT]},
+                    {"role": "user", "content": "请输出摘要 JSON。"},
+                ]
+                answer = await client.complete(messages, max_tokens=_summary_max_tokens())
+        data = _extract_json(answer) or {}
+        summary = _normalize_image_post_summary(data, title_hint=title_hint)
+        if output_path is not None:
+            _write_summary(output_path, summary)
+        return summary
+    except Exception as exc:  # noqa: BLE001 — 摘要失败不致命
+        import logging
+
+        logging.getLogger(__name__).warning("image post summary generation failed: %s", exc)
+        return {}
+    finally:
+        if owns:
+            try:
+                await client._client.aclose()
+            except Exception:
+                pass
+
+
+def _write_summary(output_path, summary: dict[str, Any]) -> None:
+    try:
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(output_path).write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        logger.warning("write summary.json failed: %s", exc)

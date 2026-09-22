@@ -1,0 +1,15 @@
+# P2 · AI 视频解析 Agent 配置
+# 密钥一律走 ${ENV} 占位符，不写进本文件。
+# development：从环境变量取；test / production：从 $APP_SECRET_ROOT/<同名文件> 取。
+model_relay:
+  base_url: ${MODEL_RELAY_BASE_URL}
+  api_key: ${MODEL_RELAY_API_KEY}
+  chat_model: ${CHAT_MODEL}
+  timeout_seconds: 300
+  chat_pre_stream_max_retries: 1
+  retry_base_delay_seconds: 1
+
+database:
+  url: ${DATABASE_URL}
+  pool_size: 5
+  pool_recycle_seconds: 1800

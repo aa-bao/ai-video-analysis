@@ -1,0 +1,56 @@
+server {
+    listen 80;
+    server_name _;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # CSP（规范 10 §12）：script-src 单独列出且不使用 'unsafe-inline'（脚本必须独立 .js + <script src>）。
+    # frame-ancestors 允许的主系统受控域名由环境变量 ALLOWED_FRAME_ANCESTORS 注入
+    # （多值空格分隔，如 "https://rpa.example.com https://console.example.com"）；
+    # 未设置时回退 'self'，仅允许同源嵌入，不会放开到任意站点。
+    location /api/ {
+        add_header Content-Security-Policy "default-src 'self'; script-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; connect-src 'self'; font-src 'self' data:; frame-ancestors 'self' ${ALLOWED_FRAME_ANCESTORS}" always;
+        add_header X-Content-Type-Options nosniff always;
+        add_header Referrer-Policy no-referrer always;
+        proxy_pass ${BACKEND_ORIGIN};
+        proxy_http_version 1.1;
+    }
+
+    # ── 静态产物：文件名带内容哈希 → 可长期强缓存 ──
+    # ⚠️ 缺失的资源必须 `=404`。若落进 SPA 回退拿到 index.html（text/html），浏览器会按
+    #    strict MIME checking 拒绝执行，报 "Refused to apply style … MIME type ('text/html')"
+    #    / "Failed to load module script … text/html"，真实原因（资源不存在）被掩盖成整页白屏。
+    location /assets/ {
+        add_header X-Content-Type-Options nosniff always;
+        add_header Referrer-Policy no-referrer always;
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+        try_files $uri =404;
+    }
+
+    # ── SPA 入口：必须禁缓存 ──
+    # ⚠️ 镜像构建用 `touch -d @${SOURCE_DATE_EPOCH}`（=0，为构建可复现）把所有文件 mtime
+    #    归一为 1970-01-01 → 响应带 `Last-Modified: Thu, 01 Jan 1970`，且 ETag 只由
+    #    mtime+size 推出。浏览器对此套用 heuristic freshness（≈ 10% × age ≈ 5.6 年），
+    #    把 index.html 当"长期新鲜"而**从不回源校验**；重新部署后旧 index.html 仍按
+    #    **旧 chunk 哈希**请求资源 → 全部 404 → 白屏。故这里强制 no-store。
+    location = /index.html {
+        add_header Content-Security-Policy "default-src 'self'; script-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; connect-src 'self'; font-src 'self' data:; frame-ancestors 'self' ${ALLOWED_FRAME_ANCESTORS}" always;
+        add_header X-Content-Type-Options nosniff always;
+        add_header Referrer-Policy no-referrer always;
+        add_header Cache-Control "no-cache, no-store, must-revalidate" always;
+    }
+
+    location / {
+        add_header Content-Security-Policy "default-src 'self'; script-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; connect-src 'self'; font-src 'self' data:; frame-ancestors 'self' ${ALLOWED_FRAME_ANCESTORS}" always;
+        add_header X-Content-Type-Options nosniff always;
+        add_header Referrer-Policy no-referrer always;
+        add_header Cache-Control "no-cache" always;
+        # 嵌入部署：主系统整页导航到嵌套路由(/settings、/video/library)时，相对资源 ./assets
+        # 会被解析成 /settings/assets 并命中 SPA 回退返回 index.html(text/html)，导致 MIME 错误白屏。
+        # 这里把任意前缀下的 /assets/ 归一化回 /assets/，SPA 路由本身不含 /assets/ 不受影响。
+        # 用 `last` 而非 `break`：归一化后重新匹配 location，让上面的 /assets/ 段接手，
+        # 从而缺失资源得到 **404** 而不是又一次 SPA 回退。
+        rewrite ^/.+/assets/(.*)$ /assets/$1 last;
+        try_files $uri $uri/ /index.html;
+    }
+}

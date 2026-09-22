@@ -1,0 +1,57 @@
+# =============================================================================
+# P2（AI 视频解析）后端镜像构建上下文排除规则
+# 根 Dockerfile 的 build.context = .（即本目录），仅构建后端 video 服务；
+# web/ 与 wx-channels/ 各有独立构建上下文（见 docker-compose.yml），不受本文件影响。
+# =============================================================================
+
+# ── Python 虚拟环境（Windows 版，致命项，必须排除）──
+# 本地 .venv 是 Windows 虚拟环境（含 Scripts/python.exe、pyvenv.cfg）。
+# 若被 COPY 进构建上下文，会覆盖 build 阶段 uv 在 Linux 上创建的 .venv/pyvenv.cfg，
+# 导致镜像内 PATH=/app/.venv/bin 失效、容器无法启动。
+.venv
+
+# ── Python 字节码缓存 ──
+__pycache__
+*.pyc
+
+# ── pytest 缓存 ──
+.pytest_cache
+
+# ── pytest 残留临时目录（实测存在 6 个：.pytest-tmp-*）──
+.pytest-tmp-*
+
+# ── 阶段遗留备份目录（.phase5a-backup）──
+.phase5a-backup
+
+# ── 运行时本地数据目录（compose 以卷挂载，镜像内不需要）──
+# data：应用数据卷；wx-cookies：wx-channels 运行期 cookie，均非镜像所需
+data
+wx-cookies
+
+# ── ⚠️ Cookie 凭据：绝不进镜像 ──
+# 这些是明文登录态（抖音 / 通用），一旦 COPY 进镜像层就会**永久留在层里**
+# （即使运行时用卷挂载覆盖路径，历史层中依然可提取 —— 实测踩过：
+#   `cookies_douyin.txt.bak` 被 save_douyin_cookie() 自动生成，
+#   最初只排除了 `*.probe-bak`，结果 .bak 带着 sessionid_ss 进了镜像层）。
+# 凭据只允许通过：
+#   ① 设置页写入 → 落在 videodata 卷的 /app/data/video/cookies/（生产路径）
+#   ② 宿主 ./data/video/cookies/ 目录（卷挂载带入）
+cookies*.txt
+cookies*
+*.probe-bak
+*.bak
+secrets
+
+# ── 测试与脚本目录（非镜像运行所需）──
+tests
+scripts
+
+# ── 工作流/工具残留目录（含备份、报告、日志，污染镜像）──
+.workbuddy
+*.log
+
+# ── 前端与微信视频号子目录：根 Dockerfile 只构建后端 video 服务 ──
+# web/（含 211MB 的 node_modules）与 wx-channels/ 各有独立构建上下文
+# （context: web / ./wx-channels），根构建上下文无需它们，排除可避免无谓膨胀。
+web
+wx-channels
